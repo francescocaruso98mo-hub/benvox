@@ -3,8 +3,8 @@
 MARCO - agente di ricerca benefit aziendali per Benevox.
 
 Pipeline:
-  1. Ricerca web sui benefit dell'azienda (tool web_search di Claude)
-  2. Estrazione dati strutturati con Claude (output JSON validato)
+  1. Ricerca web sui benefit dell'azienda (DuckDuckGo + download pagine con requests)
+  2. Estrazione dati strutturati con Groq (llama-3.3-70b-versatile, output JSON validato)
   3. Salvataggio su Supabase (tabelle `aziende` e `benefit`)
   4. Report a terminale + file JSON in ./reports
 
@@ -12,9 +12,10 @@ Uso:
   python marco.py                         # Ferrari, Maranello
   python marco.py "Barilla" --sede Parma
   python marco.py "Ferrari" --dry-run     # non scrive su Supabase
+  python marco.py "Ferrari" --url https://...   # aggiunge pagine da leggere
 
 Variabili d'ambiente (vedi .env.example):
-  ANTHROPIC_API_KEY, SUPABASE_URL, SUPABASE_SECRET_KEY
+  GROQ_API_KEY, SUPABASE_URL, SUPABASE_SECRET_KEY
 """
 
 from __future__ import annotations
@@ -22,13 +23,16 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
+import time
 from datetime import datetime, timezone
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Literal, Optional
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
-import anthropic
+import groq
 import requests
 from pydantic import BaseModel, Field, ValidationError
 from supabase import Client, create_client
@@ -40,10 +44,7 @@ try:
 except ImportError:
     pass
 
-MODEL = "claude-opus-5-5"
-# Instrada automaticamente la richiesta su un altro modello se quello
-# principale la rifiuta per policy (vedi docs "refusals and fallback").
-FALLBACK_BETA = "server-side-fallback-2026-07-01"
+MODEL = "llama-3.3-70b-versatile"
 
 CATEGORIE = ("smart_working", "mensa", "welfare", "sanita", "premi", "sconti", "altro")
 Categoria = Literal["smart_working", "mensa", "welfare", "sanita", "premi", "sconti", "altro"]
@@ -59,6 +60,36 @@ ICONE = {
 }
 
 REPORT_DIR = Path(__file__).with_name("reports")
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+    "Accept-Language": "it-IT,it;q=0.9,en;q=0.6",
+}
+
+# Limiti pensati per il piano gratuito Groq (llama-3.3-70b: ~12k token/minuto).
+RISULTATI_PER_QUERY = 4
+MAX_PAGINE = 10
+MAX_CARATTERI_PAGINA = 2500
+MAX_CARATTERI_TOTALI = 20000
+
+QUERY = [
+    "{azienda} {sede} benefit dipendenti",
+    "{azienda} welfare aziendale dipendenti",
+    "{azienda} premio di competitività contratto integrativo",
+    "{azienda} smart working dipendenti",
+    "{azienda} mensa aziendale assistenza sanitaria dipendenti",
+    "{azienda} sconti convenzioni dipendenti",
+    "{azienda} recensioni dipendenti benefit glassdoor",
+]
+
+PAROLE_CHIAVE = re.compile(
+    r"benefit|welfare|smart.?working|lavoro (agile|ibrido|da remoto)|remote|ibrid|"
+    r"mensa|pasto|pasti|ticket|buon[io] pasto|sanit|salute|medic|check.?up|assicuraz|"
+    r"premio|premi |bonus|competitivit|integrativ|retribu|stipend|aument|"
+    r"sconto|sconti|convenzion|asilo|nido|borse di studio|formazione|palestra|fitness|"
+    r"dipendenti|lavoratori|employees|headcount|perk|canteen|health|discount|flexib",
+    re.IGNORECASE,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -81,34 +112,10 @@ class ProfiloAzienda(BaseModel):
     note: Optional[str] = None
 
 
-# Schema JSON per structured outputs (additionalProperties: false ovunque).
-SCHEMA_ESTRAZIONE = {
-    "type": "object",
-    "properties": {
-        "nome": {"type": "string"},
-        "settore": {"type": ["string", "null"]},
-        "sede_principale": {"type": ["string", "null"]},
-        "headcount": {"type": ["integer", "null"]},
-        "note": {"type": ["string", "null"]},
-        "benefit": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "nome": {"type": "string"},
-                    "descrizione": {"type": "string"},
-                    "categoria": {"type": "string", "enum": list(CATEGORIE)},
-                    "affidabilita": {"type": "string", "enum": ["alta", "media", "bassa"]},
-                    "fonti": {"type": "array", "items": {"type": "string"}},
-                },
-                "required": ["nome", "descrizione", "categoria", "affidabilita", "fonti"],
-                "additionalProperties": False,
-            },
-        },
-    },
-    "required": ["nome", "settore", "sede_principale", "headcount", "note", "benefit"],
-    "additionalProperties": False,
-}
+class Pagina(BaseModel):
+    url: str
+    titolo: str
+    testo: str
 
 
 # --------------------------------------------------------------------------- #
@@ -121,142 +128,222 @@ def env(name: str, required: bool = True) -> Optional[str]:
     return value
 
 
-def testo_da_risposta(response) -> str:
-    """Concatena i blocchi di testo, ignorando thinking, tool e blocchi fallback."""
-    return "\n".join(b.text for b in response.content if b.type == "text").strip()
+class _EstrattoreTesto(HTMLParser):
+    """Estrae titolo e testo visibile da una pagina HTML (solo libreria standard)."""
+
+    IGNORA = {"script", "style", "noscript", "svg", "nav", "footer", "header", "form", "iframe"}
+    BLOCCHI = {"p", "div", "li", "br", "h1", "h2", "h3", "h4", "h5", "h6", "tr", "section", "article"}
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._ignora = 0
+        self._in_title = False
+        self.titolo = ""
+        self._parti: list[str] = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self.IGNORA:
+            self._ignora += 1
+        elif tag == "title":
+            self._in_title = True
+        elif tag in self.BLOCCHI:
+            self._parti.append("\n")
+
+    def handle_endtag(self, tag):
+        if tag in self.IGNORA and self._ignora:
+            self._ignora -= 1
+        elif tag == "title":
+            self._in_title = False
+        elif tag in self.BLOCCHI:
+            self._parti.append("\n")
+
+    def handle_data(self, data):
+        if self._in_title:
+            self.titolo += data
+        elif not self._ignora:
+            self._parti.append(data)
+
+    def testo(self) -> str:
+        righe = (re.sub(r"\s+", " ", r).strip() for r in "".join(self._parti).split("\n"))
+        return "\n".join(r for r in righe if len(r) > 25)
 
 
-def verifica_rifiuto(response, fase: str) -> None:
-    if response.stop_reason == "refusal":
-        dettagli = getattr(response, "stop_details", None)
-        sys.exit(f"[MARCO] Claude ha rifiutato la richiesta in fase di {fase}: {dettagli}")
-
-
-def url_raggiungibile(url: str) -> bool:
-    """Controllo leggero che una fonte citata esista davvero (HEAD, poi GET)."""
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; BenevoxMarco/1.0)"}
-    try:
-        r = requests.head(url, headers=headers, timeout=8, allow_redirects=True)
-        if r.status_code in (403, 405) or r.status_code >= 500:
-            r = requests.get(url, headers=headers, timeout=8, stream=True)
-        return r.status_code < 400
-    except requests.RequestException:
-        return False
+def estratti_rilevanti(testo: str, limite: int) -> str:
+    """Tiene solo le righe che parlano di benefit, per stare nei limiti di token."""
+    righe = testo.split("\n")
+    scelte = [r for r in righe if PAROLE_CHIAVE.search(r)]
+    return "\n".join(scelte)[:limite]
 
 
 # --------------------------------------------------------------------------- #
 # 1. Ricerca web
 # --------------------------------------------------------------------------- #
-PROMPT_RICERCA = """Sei MARCO, ricercatore di Benevox, piattaforma italiana che raccoglie \
-informazioni REALI sui benefit aziendali.
-
-Cerca sul web informazioni sui benefit per i dipendenti di "{azienda}"{sede_txt}.
-
-Copri almeno queste aree:
-- smart working / lavoro ibrido / flessibilità oraria
-- mensa aziendale, buoni pasto
-- welfare aziendale (piattaforme welfare, rimborsi, asili nido, borse di studio, trasporti)
-- sanità integrativa, check-up, assistenza medica
-- premi di risultato / competitività, bonus, aumenti legati al contratto integrativo
-- sconti e convenzioni per i dipendenti (es. prodotti aziendali, palestre, negozi)
-
-Fonti preferite: sito ufficiale e pagine carriere, bilanci / report di sostenibilità, \
-comunicati stampa, accordi sindacali (contratto integrativo aziendale), testate \
-giornalistiche affidabili, recensioni di dipendenti (Glassdoor, Indeed) come fonte \
-secondaria. Preferisci informazioni recenti e indica l'anno quando disponibile.
-
-Raccogli anche: settore, sede principale, numero di dipendenti.
-
-Restituisci un resoconto dettagliato in italiano, organizzato per area. Per ogni \
-informazione indica l'URL della fonte. Se due fonti sono in conflitto, riportale \
-entrambe. Non inventare nulla: se un'area non è documentata, scrivilo."""
-
-
-def ricerca_web(client: anthropic.Anthropic, azienda: str, sede: Optional[str]) -> tuple[str, list[str]]:
-    sede_txt = f" (sede: {sede})" if sede else ""
-    messages = [{"role": "user", "content": PROMPT_RICERCA.format(azienda=azienda, sede_txt=sede_txt)}]
-    tools = [{
-        "type": "web_search_20260209",
-        "name": "web_search",
-        "max_uses": 15,
-        "user_location": {"type": "approximate", "country": "IT", "timezone": "Europe/Rome"},
-    }]
-
-    fonti: list[str] = []
-    for _ in range(6):  # continua i turni in pausa (pause_turn), con un tetto
-        with client.beta.messages.stream(
-            model=MODEL,
-            max_tokens=64000,
-            betas=[FALLBACK_BETA],
-            fallbacks="default",
-            output_config={"effort": "high"},
-            tools=tools,
-            messages=messages,
-        ) as stream:
-            response = stream.get_final_message()
-
-        verifica_rifiuto(response, "ricerca")
-        for block in response.content:
-            if block.type == "web_search_tool_result" and isinstance(block.content, list):
-                fonti.extend(r.url for r in block.content if getattr(r, "url", None))
-
-        if response.stop_reason != "pause_turn":
+def cerca_duckduckgo(query: str, n: int) -> list[str]:
+    r = requests.get(
+        "https://html.duckduckgo.com/html/",
+        params={"q": query, "kl": "it-it"},
+        headers=HEADERS,
+        timeout=15,
+    )
+    r.raise_for_status()
+    urls = []
+    for href in re.findall(r'class="result__a"[^>]*href="([^"]+)"', r.text):
+        href = href.replace("&amp;", "&")
+        if "duckduckgo.com/l/" in href:  # link di redirect: l'URL vero è nel parametro uddg
+            href = parse_qs(urlparse(href).query).get("uddg", [""])[0]
+        if href.startswith("http") and "duckduckgo.com" not in href:
+            urls.append(href)
+        if len(urls) >= n:
             break
-        messages.append({"role": "assistant", "content": response.content})
+    return urls
 
-    resoconto = testo_da_risposta(response)
-    if not resoconto:
-        sys.exit("[MARCO] La ricerca non ha prodotto alcun resoconto.")
-    return resoconto, list(dict.fromkeys(fonti))
+
+def scarica_pagina(url: str) -> Optional[Pagina]:
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=15)
+    except requests.RequestException:
+        return None
+    if r.status_code >= 400 or "html" not in r.headers.get("Content-Type", ""):
+        return None
+    r.encoding = r.encoding or r.apparent_encoding
+    parser = _EstrattoreTesto()
+    try:
+        parser.feed(r.text)
+    except Exception:
+        return None
+    testo = estratti_rilevanti(parser.testo(), MAX_CARATTERI_PAGINA)
+    if len(testo) < 200:
+        return None
+    return Pagina(url=r.url, titolo=re.sub(r"\s+", " ", parser.titolo).strip()[:150], testo=testo)
+
+
+def ricerca_web(azienda: str, sede: Optional[str], url_extra: list[str]) -> list[Pagina]:
+    candidati: list[str] = list(url_extra)
+    for q in QUERY:
+        query = q.format(azienda=azienda, sede=sede or "").replace("  ", " ")
+        try:
+            trovati = cerca_duckduckgo(query, RISULTATI_PER_QUERY)
+        except requests.RequestException as e:
+            print(f"[MARCO]     ricerca fallita per «{query}»: {e}")
+            continue
+        print(f"[MARCO]     «{query}» → {len(trovati)} risultati")
+        candidati.extend(trovati)
+        time.sleep(1.5)  # evita di essere bloccati da DuckDuckGo
+
+    pagine: list[Pagina] = []
+    totale = 0
+    for url in dict.fromkeys(candidati):
+        if len(pagine) >= MAX_PAGINE or totale >= MAX_CARATTERI_TOTALI:
+            break
+        pagina = scarica_pagina(url)
+        if pagina is None:
+            continue
+        pagina.testo = pagina.testo[: MAX_CARATTERI_TOTALI - totale]
+        totale += len(pagina.testo)
+        pagine.append(pagina)
+        print(f"[MARCO]     letta: {urlparse(pagina.url).netloc} — {pagina.titolo[:60]}")
+    return pagine
 
 
 # --------------------------------------------------------------------------- #
-# 2. Estrazione strutturata
+# 2. Estrazione strutturata (Groq)
 # --------------------------------------------------------------------------- #
-PROMPT_ESTRAZIONE = """Dal resoconto di ricerca qui sotto, estrai i benefit aziendali \
-di "{azienda}" in forma strutturata per il database Benevox.
+PROMPT_SISTEMA = """Sei MARCO, analista di Benevox, piattaforma italiana che raccoglie \
+informazioni REALI sui benefit aziendali. Rispondi SOLO con un oggetto JSON valido."""
+
+PROMPT_ESTRAZIONE = """Dagli estratti di pagine web qui sotto, estrai i benefit per i \
+dipendenti di "{azienda}"{sede_txt}.
+
+Rispondi con un oggetto JSON con esattamente questa struttura:
+{{
+  "nome": "{azienda}",
+  "settore": string o null,
+  "sede_principale": string o null,
+  "headcount": intero o null,
+  "note": string o null,
+  "benefit": [
+    {{
+      "nome": string,
+      "descrizione": string,
+      "categoria": "smart_working" | "mensa" | "welfare" | "sanita" | "premi" | "sconti" | "altro",
+      "affidabilita": "alta" | "media" | "bassa",
+      "fonti": [numeri delle pagine, es. 1, 3]
+    }}
+  ]
+}}
 
 Regole:
+- Usa SOLO informazioni presenti negli estratti. Non inventare nulla: se non trovi \
+un'area, non creare benefit per quell'area.
+- Considera solo "{azienda}" e non altre aziende citate nelle pagine.
 - Un elemento per ogni benefit distinto e concreto (niente frasi generiche come \
 "ottimo ambiente di lavoro").
-- `nome`: breve, in italiano (max ~60 caratteri), es. "Premio di competitività".
-- `descrizione`: 1-3 frasi con i dettagli concreti (importi, giorni, condizioni, anno).
-- `categoria`: una tra smart_working, mensa, welfare, sanita, premi, sconti; usa \
-"altro" solo se non rientra in nessuna (es. formazione, mobilità interna).
-- `affidabilita`: "alta" se da fonte ufficiale / accordo sindacale / stampa \
-autorevole; "media" se da una sola fonte secondaria; "bassa" se da recensioni \
-anonime o informazioni datate.
-- `fonti`: gli URL citati nel resoconto per quel benefit.
-- Compila settore, sede_principale, headcount (intero, dipendenti totali) solo se \
-presenti nel resoconto, altrimenti null.
-- Non aggiungere nulla che non sia nel resoconto.
+- "nome": breve, in italiano (max ~60 caratteri), es. "Premio di competitività".
+- "descrizione": 1-3 frasi in italiano con i dettagli concreti (importi, giorni, \
+condizioni, anno).
+- "categoria": usa "altro" solo se non rientra nelle altre (es. formazione).
+- "affidabilita": "alta" se da sito ufficiale, accordo sindacale o stampa autorevole; \
+"media" se da una sola fonte secondaria; "bassa" se da recensioni anonime o dati datati.
+- "fonti": i numeri [n] delle pagine da cui proviene l'informazione.
+- "headcount": numero totale di dipendenti, solo se indicato.
+- In "note" segnala informazioni in conflitto tra fonti o aree senza dati.
 
-<resoconto>
-{resoconto}
-</resoconto>"""
+{pagine}"""
 
 
-def estrai_dati(client: anthropic.Anthropic, azienda: str, resoconto: str) -> ProfiloAzienda:
-    with client.beta.messages.stream(
-        model=MODEL,
-        max_tokens=32000,
-        betas=[FALLBACK_BETA],
-        fallbacks="default",
-        output_config={
-            "effort": "medium",
-            "format": {"type": "json_schema", "schema": SCHEMA_ESTRAZIONE},
-        },
-        messages=[{"role": "user", "content": PROMPT_ESTRAZIONE.format(azienda=azienda, resoconto=resoconto)}],
-    ) as stream:
-        response = stream.get_final_message()
+def formatta_pagine(pagine: list[Pagina]) -> str:
+    return "\n\n".join(
+        f"<pagina n=\"{i}\" url=\"{p.url}\" titolo=\"{p.titolo}\">\n{p.testo}\n</pagina>"
+        for i, p in enumerate(pagine, 1)
+    )
 
-    verifica_rifiuto(response, "estrazione")
-    if response.stop_reason == "max_tokens":
-        sys.exit("[MARCO] Output di estrazione troncato (max_tokens).")
-    try:
-        return ProfiloAzienda.model_validate(json.loads(testo_da_risposta(response)))
-    except (json.JSONDecodeError, ValidationError) as e:
-        sys.exit(f"[MARCO] JSON di estrazione non valido: {e}")
+
+def _normalizza_fonti(dati: dict, pagine: list[Pagina]) -> dict:
+    """Converte i numeri di pagina citati dal modello negli URL corrispondenti."""
+    for b in dati.get("benefit") or []:
+        urls = []
+        for f in b.get("fonti") or []:
+            s = str(f).strip().strip("[]")
+            if s.isdigit() and 1 <= int(s) <= len(pagine):
+                urls.append(pagine[int(s) - 1].url)
+            elif s.startswith("http"):
+                urls.append(s)
+        b["fonti"] = list(dict.fromkeys(urls))
+        if isinstance(b.get("categoria"), str):
+            b["categoria"] = b["categoria"].strip().lower().replace("à", "a").replace(" ", "_")
+    return dati
+
+
+def estrai_dati(client: groq.Groq, azienda: str, sede: Optional[str], pagine: list[Pagina]) -> ProfiloAzienda:
+    sede_txt = f" (sede: {sede})" if sede else ""
+    messages = [
+        {"role": "system", "content": PROMPT_SISTEMA},
+        {"role": "user", "content": PROMPT_ESTRAZIONE.format(
+            azienda=azienda, sede_txt=sede_txt, pagine=formatta_pagine(pagine))},
+    ]
+
+    for tentativo in range(2):
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=messages,
+            response_format={"type": "json_object"},
+            temperature=0.1,
+            max_completion_tokens=4096,
+        )
+        contenuto = response.choices[0].message.content or ""
+        try:
+            dati = _normalizza_fonti(json.loads(contenuto), pagine)
+            return ProfiloAzienda.model_validate(dati)
+        except (json.JSONDecodeError, ValidationError) as e:
+            if tentativo == 1:
+                sys.exit(f"[MARCO] JSON di estrazione non valido: {e}")
+            # Secondo tentativo: rimanda al modello l'errore da correggere.
+            messages += [
+                {"role": "assistant", "content": contenuto},
+                {"role": "user", "content": f"Il JSON non è valido: {e}. Correggilo e "
+                                            "rispondi solo con il JSON completo."},
+            ]
+    raise AssertionError("irraggiungibile")
 
 
 # --------------------------------------------------------------------------- #
@@ -312,7 +399,7 @@ def salva_su_supabase(db: Client, profilo: ProfiloAzienda, nome_azienda: str) ->
 # --------------------------------------------------------------------------- #
 # 4. Report
 # --------------------------------------------------------------------------- #
-def stampa_report(profilo: ProfiloAzienda, fonti: list[str], fonti_ok: dict[str, bool], esito: Optional[dict]) -> None:
+def stampa_report(profilo: ProfiloAzienda, pagine: list[Pagina], esito: Optional[dict]) -> None:
     linea = "=" * 72
     print(f"\n{linea}\n  MARCO · Report benefit — {profilo.nome}\n{linea}")
     print(f"  Settore:     {profilo.settore or '—'}")
@@ -329,8 +416,9 @@ def stampa_report(profilo: ProfiloAzienda, fonti: list[str], fonti_ok: dict[str,
             print(f"     • {b.nome}  [affidabilità: {b.affidabilita}]")
             print(f"       {b.descrizione}")
             for f in b.fonti:
-                stato = "" if fonti_ok.get(f, True) else "  ⚠ non raggiungibile"
-                print(f"       ↳ {urlparse(f).netloc or f}{stato}")
+                print(f"       ↳ {urlparse(f).netloc or f}")
+            if not b.fonti:
+                print("       ↳ ⚠ nessuna fonte indicata")
 
     mancanti = [c for c in CATEGORIE[:-1] if not any(b.categoria == c for b in profilo.benefit)]
     if mancanti:
@@ -338,7 +426,9 @@ def stampa_report(profilo: ProfiloAzienda, fonti: list[str], fonti_ok: dict[str,
     if profilo.note:
         print(f"\n  Note: {profilo.note}")
 
-    print(f"\n  Pagine consultate dalla ricerca web: {len(fonti)}")
+    print(f"\n  Pagine lette: {len(pagine)}")
+    for i, p in enumerate(pagine, 1):
+        print(f"     [{i}] {p.url}")
     if esito is None:
         print("\n  [dry-run] Nessuna scrittura su Supabase.")
     else:
@@ -349,7 +439,7 @@ def stampa_report(profilo: ProfiloAzienda, fonti: list[str], fonti_ok: dict[str,
     print(linea)
 
 
-def salva_report_json(profilo: ProfiloAzienda, resoconto: str, fonti: list[str], esito: Optional[dict]) -> Path:
+def salva_report_json(profilo: ProfiloAzienda, pagine: list[Pagina], esito: Optional[dict]) -> Path:
     REPORT_DIR.mkdir(exist_ok=True)
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     slug = "".join(c if c.isalnum() else "_" for c in profilo.nome.lower()).strip("_")
@@ -358,9 +448,8 @@ def salva_report_json(profilo: ProfiloAzienda, resoconto: str, fonti: list[str],
         "generato_il": ts,
         "modello": MODEL,
         "profilo": profilo.model_dump(),
-        "fonti_ricerca": fonti,
+        "pagine_lette": [p.model_dump() for p in pagine],
         "esito_supabase": esito,
-        "resoconto_ricerca": resoconto,
     }, ensure_ascii=False, indent=2), encoding="utf-8")
     return path
 
@@ -372,26 +461,25 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="MARCO - ricerca benefit aziendali per Benevox")
     parser.add_argument("azienda", nargs="?", default="Ferrari", help="Nome dell'azienda (default: Ferrari)")
     parser.add_argument("--sede", default="Maranello", help="Sede per disambiguare la ricerca")
+    parser.add_argument("--url", action="append", default=[], help="URL extra da leggere (ripetibile)")
     parser.add_argument("--dry-run", action="store_true", help="Non scrivere su Supabase")
     args = parser.parse_args()
 
-    env("ANTHROPIC_API_KEY")
+    client = groq.Groq(api_key=env("GROQ_API_KEY"))
     db = None
     if not args.dry_run:
         db = create_client(env("SUPABASE_URL"), env("SUPABASE_SECRET_KEY"))
 
-    client = anthropic.Anthropic()
-
     print(f"[MARCO] 1/4 Ricerca web sui benefit di {args.azienda} ({args.sede})…")
-    resoconto, fonti = ricerca_web(client, args.azienda, args.sede)
-    print(f"[MARCO]     {len(fonti)} pagine consultate.")
+    pagine = ricerca_web(args.azienda, args.sede, args.url)
+    if not pagine:
+        sys.exit("[MARCO] Nessuna pagina utile trovata. DuckDuckGo potrebbe aver limitato "
+                 "le richieste: riprova più tardi o passa delle pagine con --url.")
+    print(f"[MARCO]     {len(pagine)} pagine utili lette.")
 
-    print("[MARCO] 2/4 Estrazione dati strutturati con Claude…")
-    profilo = estrai_dati(client, args.azienda, resoconto)
+    print(f"[MARCO] 2/4 Estrazione dati strutturati con Groq ({MODEL})…")
+    profilo = estrai_dati(client, args.azienda, args.sede, pagine)
     print(f"[MARCO]     {len(profilo.benefit)} benefit estratti.")
-
-    fonti_citate = sorted({f for b in profilo.benefit for f in b.fonti})
-    fonti_ok = {f: url_raggiungibile(f) for f in fonti_citate}
 
     esito = None
     if db is not None:
@@ -401,18 +489,18 @@ def main() -> None:
         print("[MARCO] 3/4 Salvataggio saltato (--dry-run).")
 
     print("[MARCO] 4/4 Report")
-    stampa_report(profilo, fonti, fonti_ok, esito)
-    print(f"[MARCO] Report completo salvato in {salva_report_json(profilo, resoconto, fonti, esito)}")
+    stampa_report(profilo, pagine, esito)
+    print(f"[MARCO] Report completo salvato in {salva_report_json(profilo, pagine, esito)}")
 
 
 if __name__ == "__main__":
     try:
         main()
-    except anthropic.AuthenticationError:
-        sys.exit("[MARCO] ANTHROPIC_API_KEY non valida.")
-    except anthropic.RateLimitError:
-        sys.exit("[MARCO] Rate limit Anthropic raggiunto: riprova tra qualche minuto.")
-    except anthropic.APIStatusError as e:
-        sys.exit(f"[MARCO] Errore API Anthropic {e.status_code}: {e.message}")
-    except anthropic.APIConnectionError:
-        sys.exit("[MARCO] Impossibile raggiungere l'API Anthropic (rete).")
+    except groq.AuthenticationError:
+        sys.exit("[MARCO] GROQ_API_KEY non valida.")
+    except groq.RateLimitError:
+        sys.exit("[MARCO] Limite di richieste Groq raggiunto: riprova tra qualche minuto.")
+    except groq.APIStatusError as e:
+        sys.exit(f"[MARCO] Errore API Groq {e.status_code}: {e.message}")
+    except groq.APIConnectionError:
+        sys.exit("[MARCO] Impossibile raggiungere l'API Groq (rete).")

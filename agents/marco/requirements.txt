@@ -1,4 +1,4 @@
-anthropic>=1.9.0
+groq>=0.30
 supabase>=2.18.0
 requests>=2.31
 pydantic>=2.6
